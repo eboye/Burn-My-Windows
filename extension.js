@@ -65,6 +65,20 @@ import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 // to get this working. For more details, read the other comments in this file...       //
 //////////////////////////////////////////////////////////////////////////////////////////
 
+// These are the window animations which can be replaced by an effect. Opening and
+// unminimizing windows play an effect in the window-open direction, closing and
+// minimizing windows in the window-close direction.
+const AnimationKind = {
+  OPEN: 'open',
+  CLOSE: 'close',
+  MINIMIZE: 'minimize',
+  UNMINIMIZE: 'unminimize',
+};
+
+function isOpening(kind) {
+  return kind == AnimationKind.OPEN || kind == AnimationKind.UNMINIMIZE;
+}
+
 export default class BurnMyWindows extends Extension {
 
   // ------------------------------------------------------------------------ public stuff
@@ -180,18 +194,21 @@ export default class BurnMyWindows extends Extension {
     // there. To enable animations in the overview, we check inside the method whether it
     // was called by either _mapWindow or _destroyWindow. If so, we return true. Let's see
     // if this breaks stuff left and right...
+    // Minimizing and unminimizing windows works in the same way: _minimizeWindow() and
+    // _unminimizeWindow() call _shouldAnimateActor() right before actor.ease().
+    // https://gitlab.gnome.org/GNOME/gnome-shell/-/blob/main/js/ui/windowManager.js#L1156
+    // https://gitlab.gnome.org/GNOME/gnome-shell/-/blob/main/js/ui/windowManager.js#L1224
+    // Minimizing uses the window-close direction of an effect, unminimizing uses the
+    // window-open direction.
     Main.wm._shouldAnimateActor = function(actor, types) {
-      const stack      = (new Error()).stack;
-      const forClosing = stack.includes('_destroyWindow@');
-      const forOpening = stack.includes('_mapWindow@');
+      const kind = extensionThis._getAnimationKind((new Error()).stack);
 
-      // This is also called in other cases, for instance when minimizing windows. We are
-      // only interested in window opening and window closing for now.
-      if (forClosing || forOpening) {
-
+      // This is also called in other cases, for instance when switching workspaces. We
+      // are only interested in the window animations listed in AnimationKind.
+      if (kind) {
         // If there is an applicable effect profile, we intercept the ease() method to
         // setup our own effect.
-        const chosenEffect = extensionThis._chooseEffect(actor, forOpening);
+        const chosenEffect = extensionThis._chooseEffect(actor, kind);
 
         if (chosenEffect) {
           // Store the original ease() method of the actor.
@@ -209,16 +226,12 @@ export default class BurnMyWindows extends Extension {
             // window-open or window-close animation. If not, we just call the original
             // ease() method. See also:
             // https://github.com/Schneegans/Burn-My-Windows/issues/335
-            const stack      = (new Error()).stack;
-            const forClosing = stack.includes('_destroyWindow@');
-            const forOpening = stack.includes('_mapWindow@');
-
-            if (forClosing || forOpening) {
+            if (extensionThis._getAnimationKind((new Error()).stack) == kind) {
               // Quickly restore the original behavior. Nobody noticed, I guess :D
               actor.ease = orig;
 
               // And then create the effect!
-              extensionThis._setupEffect(actor, forOpening, chosenEffect.effect,
+              extensionThis._setupEffect(actor, kind, chosenEffect.effect,
                                          chosenEffect.profile);
             } else {
               orig.apply(this, params);
@@ -407,10 +420,24 @@ export default class BurnMyWindows extends Extension {
     this._profiles.sort((a, b) => b.priority - a.priority);
   }
 
+  // Returns the AnimationKind of the window animation which is currently set up by the
+  // WindowManager, or null if the given call stack does not belong to a window animation
+  // we are interested in.
+  _getAnimationKind(stack) {
+    if (stack.includes('_mapWindow@')) return AnimationKind.OPEN;
+    if (stack.includes('_destroyWindow@')) return AnimationKind.CLOSE;
+    if (stack.includes('_minimizeWindow@')) return AnimationKind.MINIMIZE;
+    if (stack.includes('_unminimizeWindow@')) return AnimationKind.UNMINIMIZE;
+    return null;
+  }
+
   // This method selects an effect profile matching the current circumstances. Then a
   // random effect from its enabled effects will be selected. It returns null if no
   // profile is currently applicable.
-  _chooseEffect(actor, forOpening) {
+  _chooseEffect(actor, kind) {
+    const forOpening = isOpening(kind);
+    const forMinimizing =
+      kind == AnimationKind.MINIMIZE || kind == AnimationKind.UNMINIMIZE;
 
     // For now, we only add effects to normal windows and dialog windows.
     const isNormalWindow = actor.meta_window.window_type == Meta.WindowType.NORMAL;
@@ -452,7 +479,7 @@ export default class BurnMyWindows extends Extension {
 
       // These numbers match the indices in the Gtk.StringLists defined in the UI files
       // (e.g. resources/ui/adw/prefs.ui).
-      const animationType = forOpening ? 1 : 2;
+      const animationType = forMinimizing ? 3 : (forOpening ? 1 : 2);
       const windowType    = isNormalWindow ? 1 : 2;
       const powerMode     = this._upowerProxy.OnBattery ? 1 : 2;
 
@@ -467,9 +494,11 @@ export default class BurnMyWindows extends Extension {
         const profilePowerProfile  = p.settings.get_int('profile-power-profile');
 
         // First we check whether the animation type, window type, and power mode are
-        // matching.
-        let matches =
-          (profileAnimationType == 0 || profileAnimationType == animationType) &&
+        // matching. Profiles for any animation type are only used for opening and
+        // closing windows. Minimizing and restoring windows has to be enabled explicitly,
+        // as most effects look like they destroy the window.
+        const anyMatches = profileAnimationType == 0 && !forMinimizing;
+        let matches      = (anyMatches || profileAnimationType == animationType) &&
           (profileWindowType == 0 || profileWindowType == windowType) &&
           (profilePowerMode == 0 || profilePowerMode == powerMode);
 
@@ -541,7 +570,16 @@ export default class BurnMyWindows extends Extension {
 
   // This method adds the given effect using the settings from the given profile to the
   // given actor.
-  _setupEffect(actor, forOpening, effect, profile) {
+  _setupEffect(actor, kind, effect, profile) {
+    const forOpening = isOpening(kind);
+
+    // When unminimizing, the WindowManager moves and scales the actor to the icon
+    // geometry right before the ease() call. We want the effect to play at the window's
+    // actual position instead.
+    if (kind == AnimationKind.UNMINIMIZE) {
+      const rect = actor.meta_window.get_buffer_rect();
+      actor.set_position(rect.x, rect.y);
+    }
 
     // There is the weird case where an animation is already ongoing. This happens when a
     // window is closed which has been created before the session was started (e.g. when
@@ -606,10 +644,14 @@ export default class BurnMyWindows extends Extension {
       // should have been called by the original ease() methods.
       // https://gitlab.gnome.org/GNOME/gnome-shell/-/blob/main/js/ui/windowManager.js#L1487
       // https://gitlab.gnome.org/GNOME/gnome-shell/-/blob/main/js/ui/windowManager.js#L1558.
-      if (forOpening) {
+      if (kind == AnimationKind.OPEN) {
         Main.wm._mapWindowDone(global.window_manager, actor);
-      } else {
+      } else if (kind == AnimationKind.CLOSE) {
         Main.wm._destroyWindowDone(global.window_manager, actor);
+      } else if (kind == AnimationKind.MINIMIZE) {
+        Main.wm._minimizeWindowDone(global.window_manager, actor);
+      } else {
+        Main.wm._unminimizeWindowDone(global.window_manager, actor);
       }
     });
 

@@ -761,7 +761,8 @@ GitHub: <a href='https://github.com/sponsors/schneegans'>https://github.com/spon
 
     // clang-format off
     addComponent('profile-animation-type', [_('Opening Windows'),
-                                            _('Closing Windows')]);
+                                            _('Closing Windows'),
+                                            _('Minimizing & Restoring Windows')]);
     addComponent('profile-window-type',    [_('Normal Windows'),
                                             _('Dialog Windows')]);
     addComponent('profile-color-scheme',   [_('Default Color Scheme'),
